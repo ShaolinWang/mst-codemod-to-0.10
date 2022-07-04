@@ -1,5 +1,6 @@
 import * as ts from "typescript"
 import * as fs from "fs"
+import * as utils from "tsutils";
 
 // given an import, returns if it imports the given module.
 function createModuleImportMatcher(moduleName: string) {
@@ -9,74 +10,24 @@ function createModuleImportMatcher(moduleName: string) {
         node.moduleSpecifier.text === moduleName
 }
 
-// given a node, a module name and an imported property, try to see if you are importing that property somehow and returnes a predicate that matches it
-function createModulePropertyImportMatcher(moduleName: string, propertyName: string) {
-    // matches only the correct module
-    const isCorrectModuleImport = createModuleImportMatcher(moduleName)
-
-    return (node: ts.Node): undefined | ((node: ts.Node) => boolean) => {
-        // are we importing the correct module?
-        if (!isCorrectModuleImport(node)) return undefined
-        const importNode = node
-
-        // import mst from "mobx-state-tree"
-        if (!importNode.importClause.namedBindings) {
-            return (node: ts.Node) => {
-                if (!ts.isPropertyAccessExpression(node)) return false
-                if (!ts.isIdentifier(node.name)) return false
-                if (node.name.text !== propertyName) return false
-                if (!ts.isIdentifier(node.expression)) return false
-                if (node.expression.text !== importNode.importClause.name.text) return false
-                return true
-            }
-        } else if (ts.isNamespaceImport(importNode.importClause.namedBindings)) {
-            // import * as mst from "mobx-state-tree"
-            const namespaceImport = <ts.NamespaceImport>importNode.importClause.namedBindings
-            return (node: ts.Node) => {
-                if (!ts.isPropertyAccessExpression(node)) return false
-                if (!ts.isIdentifier(node.name)) return false
-                if (node.name.text !== propertyName) return false
-                if (!ts.isIdentifier(node.expression)) return false
-                if (node.expression.text !== namespaceImport.name.text) return false
-                return true
-            }
-        } else if (ts.isNamedImports(importNode.importClause.namedBindings)) {
-            // import {types as t} from "mobx-state-tree"
-            const namedImports = <ts.NamedImports>importNode.importClause.namedBindings
-            for (let i = 0; i < namedImports.elements.length; i++) {
-                const nameNode = namedImports.elements[i].propertyName
-                    ? namedImports.elements[i].propertyName
-                    : namedImports.elements[i].name
-                const realNameNode = namedImports.elements[i].name
-                if (nameNode.text === propertyName) {
-                    return (node: ts.Node) => {
-                        if (!ts.isIdentifier(node)) return false
-                        if (node.text !== realNameNode.text) return false
-                        return true
-                    }
-                }
-            }
-        }
-
-        return undefined
-    }
-}
-
-// given two matchers, combine them and matches if any passes
-function combineMatchers(a: (node: ts.Node) => boolean, b: (node: ts.Node) => boolean) {
-    return (node: ts.Node) => a(node) || b(node)
+function createExportKeywordMatcher(moduleName: string = 'Instance') {
+    return (node: ts.Node): node is ts.TypeAliasDeclaration =>
+        ts.isTypeAliasDeclaration(node) &&
+        ts.isTypeReferenceNode(node.type) &&
+        ts.isIdentifier(node.type.typeName) &&
+        node.type.typeName.escapedText === moduleName
 }
 
 // is a property access?
 function createPropertyAccessMatcher(
-    expressionMatcher: (node: ts.Node) => boolean,
     propertyName: string
 ) {
     return (node: ts.Node) =>
         ts.isPropertyAccessExpression(node) &&
-        expressionMatcher(node.expression) &&
+        ts.isIdentifier(node.expression) &&
         ts.isIdentifier(node.name) &&
-        node.name.text === propertyName
+        node.expression.escapedText === 'types' &&
+        node.name.escapedText === propertyName
 }
 
 // create a visitor that replace the this. with an identifier.
@@ -110,15 +61,58 @@ function createReplaceThisActionWithIdentifierVisitor(
     }
 }
 
-// create a ParenthesizedExpression since TS doesn't have it! D:
-function createParenthesizedExpression(expression: ts.Expression) {
-    const node = <ts.ParenthesizedExpression>ts.createNode(ts.SyntaxKind.ParenthesizedExpression)
-    node.expression = expression
-    return node
+function createGetInitialValue(context: ts.TransformationContext) {
+    const arrayPropertyAccessMatch = createPropertyAccessMatcher('array');
+    const modelPropertyAccessMatch = createPropertyAccessMatcher('model');
+    return function getInitialValue(node: ts.PropertyAssignment) {
+        const initializer = node.initializer as ts.CallExpression;
+        
+        if (!initializer.arguments || !Array.isArray(initializer.arguments)) {
+            return node;
+        }
+
+        // basic type
+        for (let i = 0; i < initializer.arguments.length; i++) {
+            const arg = initializer.arguments[i];
+            if (
+                ts.isStringLiteral(arg) ||
+                ts.isArrayLiteralExpression(arg) ||
+                ts.isNumericLiteral(arg) ||
+                arg.kind === ts.SyntaxKind.FalseKeyword ||
+                arg.kind === ts.SyntaxKind.TrueKeyword
+            ) {
+                return context.factory.createPropertyAssignment(
+                    node.name, arg
+                );
+            }
+        }
+
+        // types.array(...)
+        if(arrayPropertyAccessMatch(initializer.expression)) {
+            return context.factory.createPropertyAssignment(
+                node.name,
+                context.factory.createArrayLiteralExpression()
+            );
+        }
+
+        // types.model(...)
+        if(modelPropertyAccessMatch(initializer.expression)){
+            return context.factory.createPropertyAssignment(
+                node.name,
+                modTypesModelCall(initializer, context)
+            );
+        }
+
+        return context.factory.createPropertyAssignment(
+            node.name,
+            node.initializer
+        );
+    };
 }
 
 // change the actual types.model signature
 function modTypesModelCall(node: ts.CallExpression, context: ts.TransformationContext) {
+
     // a place for all the nodes
     let nameNode: null | ts.StringLiteral = null
     let propertiesNode: null | ts.ObjectLiteralExpression = null
@@ -149,193 +143,82 @@ function modTypesModelCall(node: ts.CallExpression, context: ts.TransformationCo
         }
     }
 
-    // create the call
-    let newCall = ts.createCall(node.expression, undefined, nameNode ? [nameNode] : [])
-
-    // new properties node distinct between views and properties
-    newCall.arguments.push(
-        ts.createObjectLiteral(
-            propertiesNode.properties.filter(property => ts.isPropertyAssignment(property)),
-            true
-        )
-    )
-
-    // are there views?
     if (propertiesNode) {
+
         const viewsNodes = propertiesNode.properties.filter(
-            property => !ts.isPropertyAssignment(property)
+            property => ts.isPropertyAssignment(property)
         )
+
         if (viewsNodes.length > 0) {
-            // new syntax uses self => {get computedProperty(){ }} instead of {get computedProperty(){}}
-            // and this becomes self
-            const computedGetNodes = propertiesNode.properties
-                .map(node => (ts.isGetAccessorDeclaration(node) ? node : null))
-                .filter(node => node !== null)
-            const viewsNodes = propertiesNode.properties
-                .map(node => (ts.isMethodDeclaration(node) ? node : null))
-                .filter(node => node !== null)
 
-            // now all will point to self
-            const selfParam = ts.createIdentifier("self")
-
-            // replace this with self in either views and gets
-            const replaceThisVisitor = createReplaceThisWithIdentifierVisitor(selfParam, context)
-            const newComputeds = computedGetNodes.map(node =>
-                ts.visitNode(node, replaceThisVisitor)
-            )
-            const newViews = viewsNodes.map(node => ts.visitNode(node, replaceThisVisitor))
+            const newViews = viewsNodes.map(node => ts.visitNode(node, createGetInitialValue(context)))
 
             // TODO: eventually handle circular dependencies
-            const newObject = ts.createObjectLiteral([].concat(newComputeds).concat(newViews), true)
-            const arrowFunction = ts.createArrowFunction(
-                undefined,
-                undefined,
-                [ts.createParameter(undefined, undefined, undefined, selfParam)],
-                undefined,
-                undefined,
-                createParenthesizedExpression(newObject)
-            )
-            newCall = ts.createCall(
-                ts.createPropertyAccess(newCall, ts.createIdentifier("views")),
-                undefined,
-                [arrowFunction]
+            return context.factory.createObjectLiteralExpression(
+                [].concat(newViews), true
             )
         }
     }
 
-    // are there any actions?
-    if (actionsNode) {
-        const actions = actionsNode.properties
-            .map(node => (ts.isMethodDeclaration(node) ? node : null))
-            .filter(node => node !== null)
-        if (actions.length > 0) {
-            // now all will point to self
-            const selfParam = ts.createIdentifier("self")
-            let stateVars: ts.VariableDeclarationList = null
-            let givenActionNodes = actions
+    return;
 
-            // is there a state on the model?
-            if (stateNode) {
-                const stateProps = stateNode.properties
-                    .map(node => (ts.isPropertyAssignment(node) ? node : null))
-                    .filter(node => node !== null)
-                if (stateProps.length > 0) {
-                    stateVars = ts.createVariableDeclarationList(
-                        stateProps.map(node =>
-                            ts.createVariableDeclaration(
-                                ts.isIdentifier(node.name)
-                                    ? node.name
-                                    : ts.createIdentifier("UNKNOWN"),
-                                undefined,
-                                node.initializer
-                            )
-                        )
-                    )
-                }
-
-                // replace this.helloState with just "helloState"
-                const knownStateNames = stateProps
-                    .map(node => (ts.isIdentifier(node.name) ? node.name.text : null))
-                    .filter(node => node !== null)
-                const removeThisStateVisitor = createReplaceThisActionWithIdentifierVisitor(
-                    knownStateNames,
-                    context
-                )
-                givenActionNodes = givenActionNodes.map(node =>
-                    ts.visitNode(node, removeThisStateVisitor)
-                )
-            }
-
-            // get all known method names
-            const knownMethodsNames = actions
-                .map(node => (ts.isIdentifier(node.name) ? node.name : null))
-                .filter(node => node !== null)
-                .map(node => node.text)
-
-            // replace this.methodName(...args) with just methodName(...args)
-            const removeThisActionVisitor = createReplaceThisActionWithIdentifierVisitor(
-                knownMethodsNames,
-                context
-            )
-            const actionsWithoutThisDotAction = givenActionNodes.map(node =>
-                ts.visitNode(node, removeThisActionVisitor)
-            )
-
-            // remove any this reference
-            const replaceThisVisitor = createReplaceThisWithIdentifierVisitor(selfParam, context)
-            const actionsWithoutThis = actionsWithoutThisDotAction.map(node =>
-                ts.visitNode(node, replaceThisVisitor)
-            )
-
-            // transform method declaration to a function
-            const actionsAsFunctions = actionsWithoutThis.map(node =>
-                ts.createFunctionDeclaration(
-                    node.decorators,
-                    node.modifiers,
-                    node.asteriskToken,
-                    ts.isIdentifier(node.name) ? node.name.text : ts.createIdentifier("UNKNOWN"),
-                    node.typeParameters,
-                    node.parameters,
-                    node.type,
-                    node.body
-                )
-            )
-
-            // create the return object
-            const returnObjectProperties = actionsAsFunctions.map(node =>
-                ts.createShorthandPropertyAssignment(node.name)
-            )
-            const returnObject = ts.createReturn(
-                ts.createObjectLiteral(returnObjectProperties, true)
-            )
-
-            // create the new function body
-            const fnBody = ts.createBlock(
-                [...(stateVars ? [stateVars] : [] as any), ...actionsAsFunctions, returnObject],
-                true
-            )
-
-            // create the return arrow function self => ({actions})
-            const arrowFunction = ts.createArrowFunction(
-                undefined,
-                undefined,
-                [ts.createParameter(undefined, undefined, undefined, selfParam)],
-                undefined,
-                undefined,
-                fnBody
-            )
-            newCall = ts.createCall(
-                ts.createPropertyAccess(newCall, ts.createIdentifier("actions")),
-                undefined,
-                [arrowFunction]
-            )
-        }
-    }
-
-    return newCall
 }
 
-function runCodemod(fileNames: string[], options: ts.CompilerOptions): void {
-    const createMobxStateTreeMatcher = createModulePropertyImportMatcher("mobx-state-tree", "types")
+// change the `import ... from 'mobx-state-tree'` to `import { makeAutoObservable } from 'mobx'`
+function modMSTImport(_node: ts.ImportDeclaration, context: ts.TransformationContext) {
+    const {
+        createImportDeclaration,
+        createImportClause,
+        createNamedImports,
+        createImportSpecifier,
+        createIdentifier,
+        createStringLiteral,
+    } = context.factory;
+    return createImportDeclaration(
+        undefined,
+        undefined,
+        createImportClause(
+            false,
+            undefined,
+            createNamedImports([
+                createImportSpecifier(
+                    false,
+                    undefined,
+                    createIdentifier("makeAutoObservable")
+                )
+            ])
+        ),
+        createStringLiteral("mobx", false)
+    );
+}
+
+// Instance
+function modMSTTypeReference(_node: ts.TypeAliasDeclaration, context: ts.TransformationContext) {
+    return context.factory.createJsxText('');
+}
+
+function runCodemod(fileNames: string[], options: ts.CompilerOptions) {
+    const mobxStateTreeImportMatcher = createModuleImportMatcher("mobx-state-tree")
+    const isExportKeywordMatcher = createExportKeywordMatcher()
+    const isModelAccessMatcher = createPropertyAccessMatcher('model');
 
     const transformer = <T extends ts.Node>(context: ts.TransformationContext) => (rootNode: T) => {
-        // store the current sourceFile MST types matcher
-        let isTypesNode: ((node: ts.Node) => boolean) = () => false
-        let isTypesModelNode: ((node: ts.Node) => boolean) = () => false
 
         function visit(node: ts.Node): ts.Node {
-            // is a MST types import?
-            const typesMatcher = createMobxStateTreeMatcher(node)
-            if (typesMatcher) {
-                isTypesNode = combineMatchers(isTypesNode, typesMatcher)
-                isTypesModelNode = createPropertyAccessMatcher(isTypesNode, "model")
+            // is a MST import?
+            if (mobxStateTreeImportMatcher(node)) {
+                return modMSTImport(node, context)
+            }
+
+            // is export Instance Type
+            if (isExportKeywordMatcher(node)) {
+                return modMSTTypeReference(node, context)
             }
 
             // is this a types.model call?
             if (ts.isCallExpression(node)) {
                 // ensure that we are using .model over the types
-                const typesModel = node.expression
-                if (isTypesModelNode(typesModel)) {
+                if (isModelAccessMatcher(node.expression)) {
                     // ok, this is a types.model call! W00T!
                     return modTypesModelCall(node, context)
                 }
@@ -377,4 +260,5 @@ function runCodemod(fileNames: string[], options: ts.CompilerOptions): void {
 // run from command line as
 // node script.js file-to-codemod.js
 // a new file with the suffix of .new will be created for you
-runCodemod(process.argv.slice(2), { allowJs: true })
+
+export default runCodemod;

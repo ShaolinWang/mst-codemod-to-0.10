@@ -1,2 +1,3 @@
 #! /usr/bin/env node
-require("./lib/index.js")
+var runCodemod = require("./lib/index.js").default
+runCodemod(process.argv.slice(2), { allowJs: true })
